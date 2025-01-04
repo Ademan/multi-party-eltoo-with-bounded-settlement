@@ -4,7 +4,7 @@ This is a fairly naive, probably broken implementation of the scheme described [
 
 At the time of writing, it isn't even a full proof of concept, but more of a way to measure the ballpark performance of this scheme.
 There are multiple improvements that can and should be made, but I'm not sure how far they can take us.
-The asymptotic performance of the scheme is exponential so either way we'll hit a hard limit pretty quickly, on my computer that seems to be in the low 10s of channel parties.
+The asymptotic performance of the scheme is exponential so either way we'll hit a hard limit pretty quickly, on my computer that seems to be between 10 and 16 channel parties, closer to 10.
 
 Run the `bench` binary (make sure to build with release mode!) to see how long each state update takes to calculate.
 The maximum latency ought to be under 20ms for recalculating an update.
