@@ -5,6 +5,7 @@ use bitcoin::{
     absolute::LockTime,
     OutPoint,
     relative::LockTime as RelativeLockTime,
+    Script,
     ScriptBuf,
     TapNodeHash,
     Transaction,
@@ -37,6 +38,7 @@ use bitcoin::opcodes::all::{
     OP_RETURN_205 as OP_PAIRCOMMIT,
     OP_RETURN,
     OP_SWAP,
+    OP_TUCK,
     OP_VERIFY,
 };
 
@@ -261,6 +263,17 @@ fn choose_k_impl(result: &mut Vec<PartySet>, parties: &PartySet, i: usize, buffe
     }
 }
 
+fn ilog2_ceil(i: usize) -> usize {
+    let mut log = i.ilog2();
+
+    // Should only ever need one at most...
+    while (1 << log) < i {
+        log += 1;
+    }
+
+    log as usize
+}
+
 pub struct StateUpdate {
     state: u32,
     split: Vec<Amount>,
@@ -297,13 +310,7 @@ impl UpdateTransactionSetBuilder {
                 generation.insert(subset, i);
             }
 
-            let mut len = generation.len();
-            // FIXME: think about and validate this calculation
-            let mut depth = 1;
-            while len > 0 {
-                len = len >> 1;
-                depth += 1;
-            }
+            let depth = Self::depth_for_generation_len(generation.len());
 
             depths.push(depth);
             generations.push(generation);
@@ -314,6 +321,16 @@ impl UpdateTransactionSetBuilder {
             keys,
             total_amount,
             depths,
+        }
+    }
+
+    fn depth_for_generation_len(generation_length: usize) -> usize {
+        assert!(generation_length != 0);
+
+        if generation_length == 1 {
+            1
+        } else {
+            ilog2_ceil(generation_length)
         }
     }
 
@@ -338,32 +355,14 @@ impl UpdateTransactionSetBuilder {
         for generation in 1..self.keys.len() {
             let depth = self.depths[generation];
 
-            // FIXME: crap might not be able to use rayon
-            // TODO: this is probably the easiest place to add rayon
-            // need to move the CTV into this map though
+            let new_script_builder = UpdateScriptBuilder::new(self.keys.len() - generation, generation, depth);
+
             let tx_templates = (&self.generations[generation]).into_par_iter()
-                .map(|(parties, _index)| {
-                    // TODO: Probably is an opportunity to reuse the script repeatedly rather than
-                    // rebuilding it
-
-                    let script_size =
-                        5 // script num
-                        + 2 // CSV DROP
-                        + (32 + 1) // updater pubkey + push opcode
-                        + 1 // CHECKSIGVERIFY
-                        + 1 // CTV
-                        + (2 * generation) // SWAP|NOP PAIRCOMMIT * generation
-                        + (2 * depth) // SWAP|NOP PAIRCOMMIT * depth
-                        + (party_count - 1) * (32 + 1) // pubkey bytes plus push opcode
-                        + (party_count - 1) * 3 // TUCK CSFS VERIFY
-                        + 0; //
-
+                .map_with(new_script_builder, |script_builder, (parties, _index)| {
                     let internal_key = XOnlyPublicKey::from_slice(Self::NUMS_POINT.as_ref())
-                        .unwrap();
+                            .unwrap();
 
-                    // TODO: I think we can hoist the script buf out of the loop pretty easily
-                    // TODO: Extract to own function for testing
-                    let mut scripts: Vec<ScriptBuf> = Vec::with_capacity(parties.len());
+                    let mut tap_nodes: Vec<TapNodeHash> = Vec::with_capacity(parties.len());
 
                     // FIXME: put this on key path instead? means more musig though
                     // Settlement TX
@@ -374,70 +373,24 @@ impl UpdateTransactionSetBuilder {
                         let builder = builder_with_capacity(33 + 1)
                             .push_slice(settlement_tx_template.as_byte_array())
                             .push_opcode(OP_CHECKTEMPLATEVERIFY);
-                        scripts.push(builder.into_script());
+                        tap_nodes.push(TapNodeHash::from_script(builder.as_script(), LeafVersion::TapScript));
                     }
 
                     if generation + 1 < party_count {
-                        scripts = parties.iter()
+                        tap_nodes = parties.iter()
                             .map(|party_id| {
-                                // FIXME: verify *all* of this
-                                let key = self.get_pubkey(*party_id).unwrap();
+                                let next_parties = PartySet(parties.iter().filter(|party| *party != party_id).cloned().collect());
 
-                                let mut builder = builder_with_capacity(script_size)
-                                    .push_int((update.state + 1) as i64)
-                                    .push_opcode(OP_CHECKSEQUENCEVERIFY)
-                                    .push_opcode(OP_DROP)
-                                    .push_x_only_key(key)
-                                    .push_opcode(OP_CHECKSIGVERIFY)
-                                    .push_opcode(OP_CHECKTEMPLATEVERIFY);
+                                let next_state_index = self.generations[generation + 1][&next_parties];
 
-                                if generation == party_count {
-                                    builder = builder
-                                        .push_opcode(OP_PAIRCOMMIT);
-                                } else {
-                                    for _ in 1..generation {
-                                        builder = builder
-                                            .push_opcode(OP_PAIRCOMMIT);
-                                    }
-                                    builder = builder
-                                        .push_opcode(OP_SWAP)
-                                        .push_opcode(OP_PAIRCOMMIT);
+                                script_builder.build_script(self, update, *party_id, next_state_index);
 
-                                    let next_parties = PartySet(parties.iter().filter(|party| *party != party_id).cloned().collect());
-
-                                    let mut index = self.generations[generation + 1][&next_parties];
-
-                                    // FIXME: check for off-by-one
-                                    for _ in 0..depth {
-                                        if (index & 1) == 1 {
-                                            builder = builder
-                                                .push_opcode(OP_NOP)
-                                                .push_opcode(OP_PAIRCOMMIT);
-                                        } else {
-                                            builder = builder
-                                                .push_opcode(OP_SWAP)
-                                                .push_opcode(OP_PAIRCOMMIT);
-                                        }
-
-                                        index = index >> 1;
-                                    }
-                                }
-
-                                builder.into_script()
+                                script_builder.as_tap_node()
                             })
                             .collect();
                     }
 
-                    let root_node_hash = taptree_commit(
-                        scripts.iter()
-                            .map(|script|
-                                TapNodeHash::from_script(
-                                    script.as_ref(),
-                                    LeafVersion::TapScript
-                                )
-                            ),
-                        8
-                    );
+                    let root_node_hash = taptree_commit(tap_nodes.into_iter(), 8);
 
                     let output = TxOut {
                         value: self.total_amount,
@@ -456,7 +409,7 @@ impl UpdateTransactionSetBuilder {
             let tx_templates: Vec<Sha256> = tx_templates
                     .map(|tx| get_default_template(&tx, 0))
                     .collect();
-            
+
             let commitment = paircommit_merkle_commit(
                 tx_templates.into_iter(),
                 depth
@@ -466,7 +419,7 @@ impl UpdateTransactionSetBuilder {
         }
 
         let mut rhs = commitments.pop().unwrap();
-        
+
         while let Some(lhs) = commitments.pop() {
             rhs = paircommit(lhs, rhs);
         }
@@ -538,6 +491,119 @@ impl UpdateTransactionSetBuilder {
             output,
         }
     }
+
+    fn iter_keys(&self) -> impl Iterator<Item=(PartyId, &XOnlyPublicKey)> {
+        self.keys.iter().enumerate().map(|(index, key)| ((index + 1) as PartyId, key))
+    }
+}
+
+#[derive(Clone)]
+struct UpdateScriptBuilder {
+    buffer: Vec<u8>,
+    generation: usize,
+    depth: usize,
+}
+
+impl UpdateScriptBuilder {
+    fn new(party_count: usize, generation: usize, depth: usize) -> Self {
+        // honestly we don't even really need to estimate if we reuse the buffer...
+        let script_size =
+            5 // script num
+            + 2 // CSV DROP
+            + (32 + 1) // updater pubkey + push opcode
+            + 1 // CHECKSIGVERIFY
+            + 1 // CTV
+            + (2 * generation) // SWAP|NOP PAIRCOMMIT * generation
+            + (2 * depth) // SWAP|NOP PAIRCOMMIT * depth
+            + (party_count - 1) * (32 + 1) // pubkey bytes plus push opcode
+            + (party_count - 1) * 3 // TUCK CSFS VERIFY
+            - 1 // Last CSFS doesn't need a VERIFY
+            + 0; //
+
+        Self {
+            buffer: Vec::with_capacity(script_size),
+            generation,
+            depth,
+        }
+    }
+
+    // A little janky but we want the builder to continue owning the buffer. Re-evaluate interface
+    // when we have lots of free time.
+    fn build_script(&mut self, update_builder: &UpdateTransactionSetBuilder, update: &StateUpdate, party_id: PartyId, mut next_state_index: usize) {
+        let key = update_builder.get_pubkey(party_id).unwrap();
+
+        // We could also just build the script once and replace things in it here. Would be
+        // *slightly* faster, probably not enough to be worth it.
+        // We actually have a large(?) opportunity to avoid copies by swapping the auth sig
+        // and the csfs sig in place instead of writing all of the keys 
+        // Need to keep track of the last auth key used to know how to build the next script 
+        let party_count = update_builder.keys.len();
+        let mut buffer = std::mem::replace(&mut self.buffer, Vec::new());
+        buffer.truncate(0);
+        let mut builder = Builder::from(buffer)
+            .push_int((update.state + 1) as i64)
+            .push_opcode(OP_CHECKLOCKTIMEVERIFY)
+            .push_opcode(OP_DROP)
+            .push_x_only_key(key)
+            .push_opcode(OP_CHECKSIGVERIFY)
+            .push_opcode(OP_CHECKTEMPLATEVERIFY);
+
+        for _ in 0..self.depth {
+            if (next_state_index & 1) == 1 {
+                builder = builder
+                    .push_opcode(OP_NOP)
+                    .push_opcode(OP_PAIRCOMMIT);
+            } else {
+                builder = builder
+                    .push_opcode(OP_SWAP)
+                    .push_opcode(OP_PAIRCOMMIT);
+            }
+
+            next_state_index = next_state_index >> 1;
+        }
+
+        for _ in 1..self.generation {
+            builder = builder
+                .push_opcode(OP_PAIRCOMMIT);
+        }
+
+        if self.generation == party_count {
+            builder = builder
+                .push_opcode(OP_PAIRCOMMIT);
+        } else {
+            builder = builder
+                .push_opcode(OP_SWAP)
+                .push_opcode(OP_PAIRCOMMIT);
+        }
+
+        let mut keys_iter = update_builder.iter_keys()
+            .filter(|(this_key_party_id, _key)| *this_key_party_id != party_id)
+            .peekable();
+
+        while let Some((_this_key_party_id, key)) = keys_iter.next() {
+            builder = builder
+                .push_opcode(OP_TUCK)
+                .push_x_only_key(key)
+                .push_opcode(OP_CHECKSIGFROMSTACK);
+
+            if keys_iter.peek().is_some() {
+                builder = builder
+                    .push_opcode(OP_VERIFY);
+            }
+        }
+
+        let mut buffer = builder.into_bytes();
+
+        std::mem::swap(&mut self.buffer, &mut buffer);
+    }
+
+    pub fn as_script(&self) -> &Script {
+        Script::from_bytes(&self.buffer)
+    }
+
+    pub fn as_tap_node(&self) -> TapNodeHash {
+        TapNodeHash::from_script(Script::from_bytes(&self.buffer), LeafVersion::TapScript)
+    }
 }
 
 impl std::ops::Deref for UpdateTransactionSetBuilder {
@@ -573,7 +639,7 @@ where
         }
 
         let right_index = stack.len() - 1;
-        let left_index = stack.len() - 2; 
+        let left_index = stack.len() - 2;
 
         let (right_item, right_depth) = stack[right_index];
         let (left_item, left_depth) = stack[left_index];
@@ -619,7 +685,7 @@ where
     }
 
     while stack.len() > 1 {
-        let top_index = stack.len() - 1;  
+        let top_index = stack.len() - 1;
         let (top_item, depth) = stack[top_index];
 
         stack.push((top_item.clone(), depth));
@@ -827,6 +893,104 @@ mod test {
             keypair.x_only_public_key().0
         })
         .collect()
+    }
+
+    fn even_split(builder: &UpdateTransactionSetBuilder) -> Vec<Amount> {
+        let party_count = builder.keys.len() as u64;
+
+        let amount_per_party = builder.total_amount / party_count;
+        let remainder = builder.total_amount % party_count;
+
+        let mut amounts: Vec<_> = builder.keys.iter().map(|_| amount_per_party).collect();
+
+        let mut remainder = remainder.to_sat();
+        for amount in amounts.iter_mut() {
+            if remainder < 1 {
+                break;
+            }
+
+            *amount += Amount::ONE_SAT;
+            remainder -= 1;
+        }
+
+        amounts
+    }
+
+    #[test]
+    fn test_update_script() {
+        let secp = Secp256k1::new();
+        let set = UpdateTransactionSetBuilder::from_parties(test_keys(&secp, 4), Amount::from_sat(100000000));
+
+        let depth = UpdateTransactionSetBuilder::depth_for_generation_len(set.generations[1].len());
+
+        let mut builder = UpdateScriptBuilder::new(3, 1, depth);
+        let update = StateUpdate { state: 1, split: even_split(&set) };
+
+        let parties = PartySet(
+            set.keys.iter().enumerate().map(|(index, _)| (index + 1) as PartyId).collect()
+        );
+
+        let mut next_parties = parties.clone();
+        next_parties.remove(1 as PartyId);
+
+        let next_state_index = set.generations[1][&next_parties];
+
+        assert_eq!(next_state_index, 3);
+
+        builder.build_script(&set, &update, 1 as PartyId, next_state_index);
+
+        let generated_script = builder.as_script().to_owned();
+
+        let expected_script = Builder::new()
+            .push_int((update.state + 1) as i64)
+            .push_opcode(OP_CHECKLOCKTIMEVERIFY)
+            .push_opcode(OP_DROP)
+            // Verify
+            .push_x_only_key(&set.keys[0]) // <A>
+            .push_opcode(OP_CHECKSIGVERIFY)
+            .push_opcode(OP_CHECKTEMPLATEVERIFY)
+            // Index 3 into [ABC, ABD, ACD, BCD]
+            .push_opcode(OP_NOP)
+            .push_opcode(OP_PAIRCOMMIT)
+            .push_opcode(OP_NOP)
+            .push_opcode(OP_PAIRCOMMIT)
+            // Generation 1
+            .push_opcode(OP_SWAP)
+            .push_opcode(OP_PAIRCOMMIT)
+            // Verify B state update sig
+            .push_opcode(OP_TUCK)
+            .push_x_only_key(&set.keys[1])
+            .push_opcode(OP_CHECKSIGFROMSTACK)
+            .push_opcode(OP_VERIFY)
+            // Verify C state update sig
+            .push_opcode(OP_TUCK)
+            .push_x_only_key(&set.keys[2])
+            .push_opcode(OP_CHECKSIGFROMSTACK)
+            .push_opcode(OP_VERIFY)
+            // Verify D state update sig
+            .push_opcode(OP_TUCK)
+            .push_x_only_key(&set.keys[3])
+            .push_opcode(OP_CHECKSIGFROMSTACK)
+            .into_script();
+
+        assert_eq!(expected_script.as_script(), generated_script.as_script());
+    }
+
+    #[test]
+    fn test_depth_for_len() {
+        let f = |l| UpdateTransactionSetBuilder::depth_for_generation_len(l);
+
+        assert_eq!(1, f(1));
+        assert_eq!(1, f(2));
+        assert_eq!(2, f(3));
+        assert_eq!(2, f(4));
+        assert_eq!(3, f(5));
+        assert_eq!(3, f(7));
+        assert_eq!(3, f(8));
+        assert_eq!(4, f(9));
+        assert_eq!(4, f(16));
+        assert_eq!(5, f(17));
+        assert_eq!(5, f(32));
     }
 
     #[test]
