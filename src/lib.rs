@@ -1013,13 +1013,5 @@ mod test {
         assert_eq!(set[2].len(), 10);
         assert_eq!(set[3].len(), 10);
         assert_eq!(set[4].len(), 5);
-
-        let set = UpdateTransactionSetBuilder::from_parties(test_keys(&secp, 16), Amount::from_sat(100000000));
-
-        let start = Instant::now();
-        let _ = set.get_update_commitment(&secp, &StateUpdate { state: 1, split: Vec::new()});
-        let duration = Instant::now() - start;
-
-        println!("duration = {}s", duration.as_secs_f64());
     }
 }
