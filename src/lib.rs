@@ -351,6 +351,19 @@ impl UpdateTransactionSetBuilder {
 
         let mut commitments: Vec<Sha256> = Vec::new();
 
+        // XXX: Non-penalty version
+        let settlement_tx_tapleaf_hash = {
+            let parties = PartySet(self.keys.iter().enumerate().map(|(index, _)| (index + 1) as PartyId).collect());
+            let settlement_tx = self.build_settlement_tx(secp, &parties, update);
+            let settlement_tx_template = get_default_template(&settlement_tx, 0);
+
+            let builder = builder_with_capacity(33 + 1)
+                .push_slice(settlement_tx_template.as_byte_array())
+                .push_opcode(OP_CHECKTEMPLATEVERIFY);
+
+            TapNodeHash::from_script(builder.as_script(), LeafVersion::TapScript)
+        };
+
         // Generation 0 is in the commitment transaction
         for generation in 1..self.keys.len() {
             let depth = self.depths[generation];
@@ -365,16 +378,7 @@ impl UpdateTransactionSetBuilder {
                     let mut tap_nodes: Vec<TapNodeHash> = Vec::with_capacity(parties.len());
 
                     // FIXME: put this on key path instead? means more musig though
-                    // Settlement TX
-                    {
-                        // This is the penalty version
-                        let settlement_tx = self.build_settlement_tx(secp, parties, update);
-                        let settlement_tx_template = get_default_template(&settlement_tx, 0);
-                        let builder = builder_with_capacity(33 + 1)
-                            .push_slice(settlement_tx_template.as_byte_array())
-                            .push_opcode(OP_CHECKTEMPLATEVERIFY);
-                        tap_nodes.push(TapNodeHash::from_script(builder.as_script(), LeafVersion::TapScript));
-                    }
+                    tap_nodes.push(settlement_tx_tapleaf_hash);
 
                     if generation + 1 < party_count {
                         tap_nodes = parties.iter()
