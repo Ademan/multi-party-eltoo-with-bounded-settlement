@@ -49,7 +49,6 @@ use bitcoin::secp256k1::{
 };
 
 use rayon::{
-    iter::ParallelBridge,
     iter::ParallelIterator,
     iter::IntoParallelIterator,
 };
@@ -381,17 +380,18 @@ impl UpdateTransactionSetBuilder {
                     tap_nodes.push(settlement_tx_tapleaf_hash);
 
                     if generation + 1 < party_count {
-                        tap_nodes = parties.iter()
-                            .map(|party_id| {
-                                let next_parties = PartySet(parties.iter().filter(|party| *party != party_id).cloned().collect());
+                        tap_nodes.extend(
+                            parties.iter()
+                                .map(|party_id| {
+                                    let next_parties = PartySet(parties.iter().filter(|party| **party != *party_id).cloned().collect());
 
-                                let next_state_index = self.generations[generation + 1][&next_parties];
+                                    let next_state_index = self.generations[generation + 1][&next_parties];
 
-                                script_builder.build_script(self, update, *party_id, next_state_index);
+                                    script_builder.build_script(self, update, *party_id, next_state_index);
 
-                                script_builder.as_tap_node()
-                            })
-                            .collect();
+                                    script_builder.as_tap_node()
+                                })
+                        );
                     }
 
                     let root_node_hash = taptree_commit(tap_nodes.into_iter(), 8);
