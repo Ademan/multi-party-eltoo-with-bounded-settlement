@@ -293,10 +293,11 @@ pub struct UpdateTransactionSetBuilder {
     depths: Vec<usize>,
     keys: Vec<XOnlyPublicKey>,
     total_amount: Amount,
+    settlement_relative_timelock: RelativeLockTime,
 }
 
 impl UpdateTransactionSetBuilder {
-    pub fn from_parties(keys: Vec<XOnlyPublicKey>, total_amount: Amount) -> Self {
+    pub fn from_parties(keys: Vec<XOnlyPublicKey>, total_amount: Amount, settlement_relative_timelock: RelativeLockTime) -> Self {
         let mut generations = Vec::new();
         let mut depths = Vec::new();
 
@@ -320,6 +321,7 @@ impl UpdateTransactionSetBuilder {
             keys,
             total_amount,
             depths,
+            settlement_relative_timelock,
         }
     }
 
@@ -435,9 +437,6 @@ impl UpdateTransactionSetBuilder {
         (i + 1) as PartyId
     }
 
-    // FIXME: make variable
-    const SETTLEMENT_TIMEOUT: RelativeLockTime = RelativeLockTime::from_height(69);
-
     fn build_settlement_tx<C: Verification>(&self, secp: &Secp256k1<C>, parties: &PartySet, update: &StateUpdate) -> Transaction {
         assert!(parties.len() > 0);
 
@@ -491,7 +490,7 @@ impl UpdateTransactionSetBuilder {
         Transaction {
             version: Version::non_standard(3),
             lock_time: LockTime::ZERO,
-            input: vec![dummy_input(Self::SETTLEMENT_TIMEOUT)],
+            input: vec![dummy_input(self.settlement_relative_timelock)],
             output,
         }
     }
@@ -717,6 +716,8 @@ where
 
 #[cfg(test)]
 mod test {
+    const SETTLEMENT_TIMELOCK: RelativeLockTime = RelativeLockTime::from_height(12);
+
     use bitcoin::{
         Amount,
         XOnlyPublicKey,
@@ -923,7 +924,7 @@ mod test {
     #[test]
     fn test_update_script() {
         let secp = Secp256k1::new();
-        let set = UpdateTransactionSetBuilder::from_parties(test_keys(&secp, 4), Amount::from_sat(100000000));
+        let set = UpdateTransactionSetBuilder::from_parties(test_keys(&secp, 4), Amount::from_sat(100000000), SETTLEMENT_TIMELOCK);
 
         let depth = UpdateTransactionSetBuilder::depth_for_generation_len(set.generations[1].len());
 
@@ -1000,7 +1001,7 @@ mod test {
     #[test]
     fn test_generation() {
         let secp = Secp256k1::new();
-        let set = UpdateTransactionSetBuilder::from_parties(test_keys(&secp, 5), Amount::from_sat(100000000));
+        let set = UpdateTransactionSetBuilder::from_parties(test_keys(&secp, 5), Amount::from_sat(100000000), SETTLEMENT_TIMELOCK);
 
         let start = Instant::now();
         let _ = set.get_update_commitment(&secp, &StateUpdate { state: 1, split: Vec::new()});

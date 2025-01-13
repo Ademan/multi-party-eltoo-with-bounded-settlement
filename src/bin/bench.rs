@@ -11,6 +11,7 @@ use bitcoin::secp256k1::{
 
 use bitcoin::{
     Amount,
+    relative::LockTime as RelativeLockTime,
 };
 
 use mpewbs::{
@@ -50,7 +51,8 @@ fn main() {
 
         let builder = UpdateTransactionSetBuilder::from_parties(
             keys,
-            Amount::ONE_BTC
+            Amount::ONE_BTC,
+            RelativeLockTime::from_height(12),
         );
 
         let sats_per_party = Amount::ONE_BTC.to_sat() / (participant_count as u64);
