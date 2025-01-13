@@ -71,13 +71,26 @@ fn main() {
             remainder -= 1;
         }
 
-        let start = Instant::now();
-        let update = StateUpdate::new(1, split);
-        let _commitment = builder.get_update_commitment(&secp, &update);
-        let duration = Instant::now() - start;
+        let mut durations: Vec<Duration> = Vec::new();
+        const ITERATIONS: u32 = 10;
+        for i in 1..=ITERATIONS {
+            let update = StateUpdate::new(i, split.clone());
+
+            let start = Instant::now();
+            let _commitment = builder.get_update_commitment(&secp, &update);
+            durations.push(Instant::now() - start);
+        }
+
+        durations.sort();
+
+        // Yes we could just time the whole thing but we could do stats if we record individually
+        let total_duration = durations.iter().fold(Duration::ZERO, |a, b| a + *b);
+        let duration = total_duration / ITERATIONS;
 
         let ms = duration.as_secs_f64() * 1000.0;
-        println!("Parties: {participant_count} Duration: {ms:.3}ms");
+        let best_ms = durations.first().unwrap().as_secs_f64() * 1000.0;
+        let worst_ms = durations.last().unwrap().as_secs_f64() * 1000.0;
+        println!("Parties: {participant_count:3} Duration: best: {best_ms:8.3}ms mean: {ms:8.3}ms worst: {worst_ms:8.3}ms");
 
         if duration > Duration::from_secs(1) {
             break;
