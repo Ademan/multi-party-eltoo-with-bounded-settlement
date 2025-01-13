@@ -26,3 +26,14 @@ In the penalty scheme, the other parties cannot publish the second-to-latest sta
 
 By adding more states to every update, we can enable honest parties to safely publish state S even when S+1 has been fully signed (but the malicious party has witheld signatures).
 I'm not positive yet how much extra complexity that adds, but I expect it to be significant.
+
+Every update we partition the set of all parties into two subsets: `can_update` and `cant_update`.
+In the penalty version we partition `cant_update` into three subsets: `penalized`, `maybe_penalize`, `last_updater`.
+`maybe_penalize` and `last_updater` are both sizes 0 or 1.
+The `maybe_penalize` set empties into the `penalized` set every update.
+Every update, the `maybe_penalize` set is emptied into the `penalized` set.
+If the update only advances the state by one, and does not have a revocation signature for the new state, the `last_updater` moves into the `maybe_penalize` set and the updater enters the `last_updater` set.
+If the update only advances the state by one, and does have a revocation signature for the new state, the `last_updater` and `maybe_penalize` move directly into the `penalized` set and the current updater becomes the new `last_updater`.
+If the update advances the state by more than one then the `maybe_penalize` and `last_updater` move into the `penalized` set.
+
+This should add `P choose 2 + P choose 1 + 1` states for P in `[0, max_generation]`

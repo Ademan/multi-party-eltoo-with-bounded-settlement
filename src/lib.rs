@@ -1,3 +1,5 @@
+mod penalty;
+
 use bitcoin::{
     Amount,
     script::Builder,
