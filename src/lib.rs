@@ -263,14 +263,7 @@ fn choose_k_impl(result: &mut Vec<PartySet>, parties: &PartySet, i: usize, buffe
 }
 
 fn ilog2_ceil(i: usize) -> usize {
-    let mut log = i.ilog2();
-
-    // Should only ever need one at most...
-    while (1 << log) < i {
-        log += 1;
-    }
-
-    log as usize
+    ((i << 1) - 1).ilog2() as usize
 }
 
 pub struct StateUpdate {
