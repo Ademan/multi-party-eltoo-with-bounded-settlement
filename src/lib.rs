@@ -161,7 +161,7 @@ where
 
 type PartyId = u8;
 
-pub const NULL_PARTY: PartyId = 0;
+pub const NULL_PARTY: PartyId = 255;
 
 #[derive(Clone,Debug,PartialEq,Eq,PartialOrd,Ord)]
 pub struct PartySet(Vec<PartyId>);
@@ -173,7 +173,7 @@ impl PartySet {
 
     pub fn first_n(n: usize) -> Self {
         Self (
-            (0..n).map(|i| (i + 1) as PartyId).collect()
+            (0..n).map(|i| i as PartyId).collect()
         )
     }
 
@@ -198,7 +198,7 @@ impl PartySet {
                     self.0[source] = self.0[dest];
                     dest += 1;
                 }
-                self.0.resize(original_length, NULL_PARTY);
+                self.0.truncate(original_length);
                 return false;
             } else {
                 dest -= 1;
@@ -221,6 +221,44 @@ impl PartySet {
     pub fn contains(&self, party: PartyId) -> bool {
         //println!("{:?}", &self.0[..]);
         self.0.binary_search(&party).is_ok()
+    }
+
+    pub fn iter_dense<'a>(&'a self) -> DensePartyIterator<'a> {
+        DensePartyIterator {
+            parties: self,
+            current_party: 0,
+            i: 0,
+        }
+    }
+}
+
+struct DensePartyIterator<'a> {
+    parties: &'a PartySet,
+    current_party: u32,
+    i: usize,
+}
+
+impl<'a> Iterator for DensePartyIterator<'a> {
+    type Item = Option<PartyId>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.i >= self.parties.len() {
+            return None;
+        }
+
+        if self.current_party == self.parties[self.i] as u32 {
+            let result = Some(self.current_party as PartyId);
+            self.i += 1;
+            self.current_party += 1;
+
+            Some(result)
+        } else if self.current_party < self.parties[self.i] as u32 {
+            self.current_party += 1;
+
+            Some(None)
+        } else {
+            unreachable!()
+        }
     }
 }
 
@@ -262,8 +300,8 @@ fn choose_k_impl(result: &mut Vec<PartySet>, parties: &PartySet, i: usize, buffe
     }
 }
 
-fn ilog2_ceil(i: usize) -> usize {
-    ((i << 1) - 1).ilog2() as usize
+fn ilog2_ceil(i: usize) -> u32 {
+    ((i << 1) - 1).ilog2()
 }
 
 pub struct StateUpdate {
@@ -283,7 +321,7 @@ impl StateUpdate {
 
 pub struct UpdateTransactionSetBuilder {
     generations: Vec<BTreeMap<PartySet, usize>>,
-    depths: Vec<usize>,
+    depths: Vec<u32>,
     keys: Vec<XOnlyPublicKey>,
     total_amount: Amount,
     settlement_relative_timelock: RelativeLockTime,
@@ -318,7 +356,7 @@ impl UpdateTransactionSetBuilder {
         }
     }
 
-    fn depth_for_generation_len(generation_length: usize) -> usize {
+    fn depth_for_generation_len(generation_length: usize) -> u32 {
         assert!(generation_length != 0);
 
         if generation_length == 1 {
@@ -332,12 +370,7 @@ impl UpdateTransactionSetBuilder {
     const NUMS_POINT: Sha256 = Sha256::const_hash("nothing-up-my-sleevee".as_bytes());
 
     fn get_pubkey(&self, party: PartyId) -> Option<&XOnlyPublicKey> {
-        // Maybe NULL_PARTY isn't doing anything useful and just creating complications
-        if party < 1 {
-            return None;
-        }
-
-        self.keys.get((party - 1) as usize)
+        self.keys.get(party as usize)
     }
 
     pub fn get_update_commitment<C: Verification>(&self, secp: &Secp256k1<C>, update: &StateUpdate) -> Sha256 {
@@ -411,7 +444,7 @@ impl UpdateTransactionSetBuilder {
 
             let commitment = paircommit_merkle_commit(
                 tx_templates.into_iter(),
-                depth
+                depth as usize,
             );
 
             commitments.push(commitment);
@@ -489,7 +522,7 @@ impl UpdateTransactionSetBuilder {
     }
 
     fn iter_keys(&self) -> impl Iterator<Item=(PartyId, &XOnlyPublicKey)> {
-        self.keys.iter().enumerate().map(|(index, key)| ((index + 1) as PartyId, key))
+        self.keys.iter().enumerate().map(|(index, key)| (index as PartyId, key))
     }
 }
 
@@ -497,11 +530,11 @@ impl UpdateTransactionSetBuilder {
 struct UpdateScriptBuilder {
     buffer: Vec<u8>,
     generation: usize,
-    depth: usize,
+    depth: u32,
 }
 
 impl UpdateScriptBuilder {
-    fn new(party_count: usize, generation: usize, depth: usize) -> Self {
+    fn new(party_count: usize, generation: usize, depth: u32) -> Self {
         // honestly we don't even really need to estimate if we reuse the buffer...
         let script_size =
             5 // script num
@@ -510,7 +543,7 @@ impl UpdateScriptBuilder {
             + 1 // CHECKSIGVERIFY
             + 1 // CTV
             + (2 * generation) // SWAP|NOP PAIRCOMMIT * generation
-            + (2 * depth) // SWAP|NOP PAIRCOMMIT * depth
+            + (2 * depth as usize) // SWAP|NOP PAIRCOMMIT * depth
             + (party_count - 1) * (32 + 1) // pubkey bytes plus push opcode
             + (party_count - 1) * 3 // TUCK CSFS VERIFY
             - 1 // Last CSFS doesn't need a VERIFY
@@ -726,6 +759,12 @@ mod test {
 
     use super::*;
 
+    fn assert_iter_dense(parties: &PartySet, expected: &[Option<PartyId>]) {
+        for (party, expected) in parties.iter_dense().zip(expected.into_iter()) {
+            assert_eq!(party, *expected);
+        }
+    }
+
     #[test]
     fn test_set() {
         let mut parties = PartySet::new();
@@ -733,12 +772,15 @@ mod test {
         parties.add(5);
         assert!(parties.contains(5));
         assert!(!parties.contains(4));
+        assert_iter_dense(&parties, &[None, None, None, None, None, Some(5)]);
         parties.add(4);
         assert!(parties.contains(4));
         parties.add(6);
         assert!(parties.contains(6));
+        assert_iter_dense(&parties, &[None, None, None, None, Some(4), Some(5), Some(6)]);
         assert!(!parties.contains(1));
         parties.add(1);
+        assert_iter_dense(&parties, &[None, Some(1), None, None, Some(4), Some(5), Some(6)]);
         parties.add(42);
         assert!(parties.contains(42));
 
@@ -756,10 +798,12 @@ mod test {
         parties.remove(42);
         assert!(!parties.contains(42));
         assert_eq!([4,6], *parties);
+        assert_iter_dense(&parties, &[None, None, None, None, Some(4), None, Some(6)]);
 
         parties.remove(6);
         assert!(!parties.contains(6));
         assert_eq!([4], *parties);
+        assert_iter_dense(&parties, &[None, None, None, None, Some(4)]);
 
         parties.remove(4);
         assert!(!parties.contains(4));
@@ -837,45 +881,45 @@ mod test {
         let parties = PartySet::first_n(5);
 
         let gen_0_parties = choose_k(&parties, 5);
-        assert_eq!(gen_0_parties[0].0, [1, 2, 3, 4, 5]);
+        assert_eq!(gen_0_parties[0].0, [0, 1, 2, 3, 4]);
 
         let gen_1_parties = choose_k(&parties, 4);
-        assert_eq!(gen_1_parties[0].0, [1, 2, 3, 4]);
-        assert_eq!(gen_1_parties[1].0, [1, 2, 3, 5]);
-        assert_eq!(gen_1_parties[2].0, [1, 2, 4, 5]);
-        assert_eq!(gen_1_parties[3].0, [1, 3, 4, 5]);
-        assert_eq!(gen_1_parties[4].0, [2, 3, 4, 5]);
+        assert_eq!(gen_1_parties[0].0, [0, 1, 2, 3]);
+        assert_eq!(gen_1_parties[1].0, [0, 1, 2, 4]);
+        assert_eq!(gen_1_parties[2].0, [0, 1, 3, 4]);
+        assert_eq!(gen_1_parties[3].0, [0, 2, 3, 4]);
+        assert_eq!(gen_1_parties[4].0, [1, 2, 3, 4]);
 
         let gen_2_parties = choose_k(&parties, 3);
-        assert_eq!(gen_2_parties[0].0, [1, 2, 3]);
-        assert_eq!(gen_2_parties[1].0, [1, 2, 4]);
-        assert_eq!(gen_2_parties[2].0, [1, 2, 5]);
-        assert_eq!(gen_2_parties[3].0, [1, 3, 4]);
-        assert_eq!(gen_2_parties[4].0, [1, 3, 5]);
-        assert_eq!(gen_2_parties[5].0, [1, 4, 5]);
-        assert_eq!(gen_2_parties[6].0, [2, 3, 4]);
-        assert_eq!(gen_2_parties[7].0, [2, 3, 5]);
-        assert_eq!(gen_2_parties[8].0, [2, 4, 5]);
-        assert_eq!(gen_2_parties[9].0, [3, 4, 5]);
+        assert_eq!(gen_2_parties[0].0, [0, 1, 2]);
+        assert_eq!(gen_2_parties[1].0, [0, 1, 3]);
+        assert_eq!(gen_2_parties[2].0, [0, 1, 4]);
+        assert_eq!(gen_2_parties[3].0, [0, 2, 3]);
+        assert_eq!(gen_2_parties[4].0, [0, 2, 4]);
+        assert_eq!(gen_2_parties[5].0, [0, 3, 4]);
+        assert_eq!(gen_2_parties[6].0, [1, 2, 3]);
+        assert_eq!(gen_2_parties[7].0, [1, 2, 4]);
+        assert_eq!(gen_2_parties[8].0, [1, 3, 4]);
+        assert_eq!(gen_2_parties[9].0, [2, 3, 4]);
 
         let gen_3_parties = choose_k(&parties, 2);
-        assert_eq!(gen_3_parties[0].0, [1, 2]);
-        assert_eq!(gen_3_parties[1].0, [1, 3]);
-        assert_eq!(gen_3_parties[2].0, [1, 4]);
-        assert_eq!(gen_3_parties[3].0, [1, 5]);
-        assert_eq!(gen_3_parties[4].0, [2, 3]);
-        assert_eq!(gen_3_parties[5].0, [2, 4]);
-        assert_eq!(gen_3_parties[6].0, [2, 5]);
-        assert_eq!(gen_3_parties[7].0, [3, 4]);
-        assert_eq!(gen_3_parties[8].0, [3, 5]);
-        assert_eq!(gen_3_parties[9].0, [4, 5]);
+        assert_eq!(gen_3_parties[0].0, [0, 1]);
+        assert_eq!(gen_3_parties[1].0, [0, 2]);
+        assert_eq!(gen_3_parties[2].0, [0, 3]);
+        assert_eq!(gen_3_parties[3].0, [0, 4]);
+        assert_eq!(gen_3_parties[4].0, [1, 2]);
+        assert_eq!(gen_3_parties[5].0, [1, 3]);
+        assert_eq!(gen_3_parties[6].0, [1, 4]);
+        assert_eq!(gen_3_parties[7].0, [2, 3]);
+        assert_eq!(gen_3_parties[8].0, [2, 4]);
+        assert_eq!(gen_3_parties[9].0, [3, 4]);
 
         let gen_4_parties = choose_k(&parties, 1);
-        assert_eq!(gen_4_parties[0].0, [1]);
-        assert_eq!(gen_4_parties[1].0, [2]);
-        assert_eq!(gen_4_parties[2].0, [3]);
-        assert_eq!(gen_4_parties[3].0, [4]);
-        assert_eq!(gen_4_parties[4].0, [5]);
+        assert_eq!(gen_4_parties[0].0, [0]);
+        assert_eq!(gen_4_parties[1].0, [1]);
+        assert_eq!(gen_4_parties[2].0, [2]);
+        assert_eq!(gen_4_parties[3].0, [3]);
+        assert_eq!(gen_4_parties[4].0, [4]);
     }
 
     fn test_keys<C: Signing>(secp: &Secp256k1<C>, n: usize) -> Vec<XOnlyPublicKey> {
@@ -925,17 +969,19 @@ mod test {
         let update = StateUpdate { state: 1, split: even_split(&set) };
 
         let parties = PartySet(
-            set.keys.iter().enumerate().map(|(index, _)| (index + 1) as PartyId).collect()
+            set.keys.iter().enumerate().map(|(index, _)| index as PartyId).collect()
         );
 
+        let updater: PartyId = 0;
+
         let mut next_parties = parties.clone();
-        next_parties.remove(1 as PartyId);
+        next_parties.remove(updater);
 
         let next_state_index = set.generations[1][&next_parties];
 
         assert_eq!(next_state_index, 3);
 
-        builder.build_script(&set, &update, 1 as PartyId, next_state_index);
+        builder.build_script(&set, &update, updater, next_state_index);
 
         let generated_script = builder.as_script().to_owned();
 
