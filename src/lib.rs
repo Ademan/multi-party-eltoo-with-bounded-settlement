@@ -466,45 +466,11 @@ impl UpdateTransactionSetBuilder {
     fn build_settlement_tx<C: Verification>(&self, secp: &Secp256k1<C>, parties: &PartySet, update: &StateUpdate) -> Transaction {
         assert!(parties.len() > 0);
 
-        let (mut split, penalty_amounts): (Vec<_>, Vec<_>) = update.split.iter()
+        let output: Vec<_> = update.split.iter()
             .zip(self.keys.iter())
-            .enumerate()
-            .map(|(i, (amount, key))| {
-                let party_id = Self::key_index_to_party_id(i);
-
-                // FIXME: we can be faster than this, but contains() is probably fast enough for
-                // our purposes (very small number of elements)
-                (parties.contains(party_id), amount.clone(), key)
-            })
-            .partition(|(valid, _, _)| *valid);
-
-        let penalty_amount = penalty_amounts.into_iter().fold(
-            Amount::from_sat(0),
-            |total, (_, amount, _)| total + amount
-        );
-
-        let party_count: u64 = parties.len() as u64;
-
-        let penalty_amount = penalty_amount.to_sat();
-
-        let penalty_per_remaining = Amount::from_sat(penalty_amount / party_count);
-
-        // FIXME: just send remainder to fees?
-        let mut remainder = penalty_amount % party_count;
-
-        for i in 0..split.len() {
-            if remainder < 1 {
-                break;
-            }
-
-            split[i].1 += penalty_per_remaining + Amount::ONE_SAT;
-            remainder -= 1;
-        }
-
-        let output: Vec<_> = split.into_iter()
-            .map(|(_, value, key)| {
+            .map(|(value, key)| {
                 TxOut {
-                    value,
+                    value: *value,
                     script_pubkey: ScriptBuf::new_p2tr(secp, *key, None),
                 }
             })
