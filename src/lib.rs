@@ -53,6 +53,7 @@ use bitcoin::secp256k1::{
 use rayon::{
     iter::ParallelIterator,
     iter::IntoParallelIterator,
+    slice::ParallelSlice,
 };
 
 use std::{io::Write, ops::Deref, collections::BTreeMap};
@@ -681,6 +682,20 @@ where
 
     assert!(stack.len() == 1);
     stack[0].0
+}
+
+pub(crate) fn par_paircommit_merkle_commit(items: &[Sha256], items_per_thread: usize, stack_size_hint: usize) -> Sha256
+{
+    let stack: Vec<(Sha256, u32)> = Vec::with_capacity(stack_size_hint);
+    let subtree_merkle_roots: Vec<_> = items.par_chunks(items_per_thread)
+        .map_with(stack, |stack, chunk| {
+            stack.clear();
+            // XXX: man that cloned burns...
+            merkle_commit(|a, b| paircommit(a, b), chunk.into_iter().map(|hash| *hash), stack)
+        })
+        .collect();
+
+    paircommit_merkle_commit(subtree_merkle_roots.into_iter(), stack_size_hint)
 }
 
 pub(crate) fn paircommit_merkle_commit<I>(transaction_templates: I, stack_size_hint: usize) -> Sha256
