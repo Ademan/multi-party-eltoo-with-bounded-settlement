@@ -654,31 +654,20 @@ where
     }
 }
 
-pub(crate) fn merkle_commit<PC, T, I>(commit: PC, items: I, stack_size_hint: usize) -> T
+pub(crate) fn merkle_commit<PC, T, I>(commit: PC, items: I, stack: &mut Vec<(T, u32)>) -> T
 where
     I: Iterator<Item=T>,
     PC: Fn(T, T) -> T,
     T: Copy,
 {
     let mut max_stack = 0 as usize;
-    let mut stack: Vec<(T, u32)> = Vec::new();
-
-    if stack_size_hint > 0 {
-        stack.reserve(stack_size_hint);
-    } else {
-        let (items_size_hint, _) = items.size_hint();
-        // FIXME: barely thought about this but it's just a hint anyway
-        if let Some(stack_size_hint) = ((items_size_hint << 1) - 1).checked_ilog2() {
-            stack.reserve(stack_size_hint as usize);
-        }
-    }
 
     for item in items {
         stack.push((item, 0));
 
         max_stack = usize::max(max_stack, stack.len());
 
-        compress_commitment_stack(&commit, &mut stack);
+        compress_commitment_stack(&commit, stack);
     }
 
     while stack.len() > 1 {
@@ -687,7 +676,7 @@ where
 
         stack.push((top_item.clone(), depth));
 
-        compress_commitment_stack(&commit, &mut stack);
+        compress_commitment_stack(&commit, stack);
     }
 
     assert!(stack.len() == 1);
@@ -698,14 +687,16 @@ pub(crate) fn paircommit_merkle_commit<I>(transaction_templates: I, stack_size_h
 where
     I: Iterator<Item=Sha256>
 {
-    merkle_commit(|a, b| paircommit(a, b), transaction_templates, stack_size_hint)
+    let mut stack = Vec::with_capacity(stack_size_hint);
+    merkle_commit(|a, b| paircommit(a, b), transaction_templates, &mut stack)
 }
 
 fn taptree_commit<I>(tap_leaves: I, stack_size_hint: usize) -> TapNodeHash
 where
     I: Iterator<Item=TapNodeHash>,
 {
-    merkle_commit(|a, b| TapNodeHash::from_node_hashes(a, b), tap_leaves, stack_size_hint)
+    let mut stack = Vec::with_capacity(stack_size_hint);
+    merkle_commit(|a, b| TapNodeHash::from_node_hashes(a, b), tap_leaves, &mut stack)
 }
 
 #[cfg(test)]
