@@ -454,6 +454,26 @@ impl UpdateTransactionSetBuilder {
     const BASE_TIME: u32 = 500000000;
     const NUMS_POINT: Sha256 = Sha256::const_hash("nothing-up-my-sleevee".as_bytes());
 
+    pub fn count_states_and_transitions(&self) -> (usize, usize) {
+        let mut total_states = 0;
+        let mut total_transitions = 0;
+
+        // Generation 0 is in the commitment transaction
+        for (i, generation) in self.generations.iter().enumerate() {
+            total_states += generation.transactions.len();
+            let mut generation_transitions = 0;
+
+            for tx_params in generation.transactions.iter() {
+                generation_transitions += tx_params.transitions.len();
+            }
+
+            println!("Generation {i} states: {}, transitions: {}", generation.transactions.len(), generation_transitions);
+            total_transitions += generation_transitions;
+        }
+
+        (total_states, total_transitions)
+    }
+
     pub fn get_update_commitment<C: Verification>(&self, secp: &Secp256k1<C>, update: &StateUpdate) -> Sha256 {
         let mut commitments: Vec<Sha256> = Vec::new();
 

@@ -1,4 +1,4 @@
-mod penalty;
+pub mod penalty;
 
 use bitcoin::{
     Amount,
@@ -245,7 +245,7 @@ impl<'a> Iterator for DensePartyIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.i >= self.parties.len() {
-            return None;
+            return Some(None);
         }
 
         if self.current_party == self.parties[self.i] as u32 {
@@ -728,7 +728,7 @@ mod test {
     use super::*;
 
     fn assert_iter_dense(parties: &PartySet, expected: &[Option<PartyId>]) {
-        for (party, expected) in parties.iter_dense().zip(expected.into_iter()) {
+        for (expected, party) in expected.into_iter().zip(parties.iter_dense()) {
             assert_eq!(party, *expected);
         }
     }
