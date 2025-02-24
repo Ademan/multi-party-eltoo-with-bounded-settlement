@@ -699,7 +699,7 @@ impl UpdateScriptBuilder {
     }
 
     pub fn as_tap_node(&self) -> TapNodeHash {
-        TapNodeHash::from_script(Script::from_bytes(&self.buffer), LeafVersion::TapScript)
+        TapNodeHash::from_script(self.as_script(), LeafVersion::TapScript)
     }
 }
 
