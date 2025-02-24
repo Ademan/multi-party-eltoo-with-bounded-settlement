@@ -16,7 +16,7 @@ use bitcoin::{
 
 use mpewbs::{
     StateUpdate,
-    UpdateTransactionSetBuilder,
+    symmetry::UpdateTransactionSetBuilder as SymmetryUpdateTransactionSetBuilder,
     penalty::UpdateTransactionSetBuilder as PenaltyUpdateTransactionSetBuilder,
 };
 
@@ -50,7 +50,7 @@ fn bench_symmetry(run_bench: bool, max_participants: Option<usize>) {
     loop {
         let keys = test_keys(&secp, participant_count);
 
-        let builder = UpdateTransactionSetBuilder::from_parties(
+        let builder = SymmetryUpdateTransactionSetBuilder::from_parties(
             keys,
             Amount::ONE_BTC,
             RelativeLockTime::from_height(12),
