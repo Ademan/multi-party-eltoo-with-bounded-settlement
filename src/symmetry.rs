@@ -1,49 +1,31 @@
 use bitcoin::{
     Amount,
     script::Builder,
-    consensus::Encodable,
     absolute::LockTime,
-    OutPoint,
     relative::LockTime as RelativeLockTime,
     Script,
     ScriptBuf,
     TapNodeHash,
     Transaction,
-    Txid,
-    transaction::TxIn,
     transaction::TxOut,
     blockdata::transaction::Version,
     taproot::LeafVersion,
-    opcodes::OP_TRUE,
-    VarInt,
-    Witness,
     XOnlyPublicKey,
 };
 
 use bitcoin::hashes::{
     Hash,
-    sha256::Midstate,
     sha256::Hash as Sha256,
-    sha256::HashEngine as Sha256Engine,
 };
 
 use bitcoin::opcodes::all::{
     OP_CLTV as OP_CHECKLOCKTIMEVERIFY,
-    OP_CSV as OP_CHECKSEQUENCEVERIFY,
     OP_CHECKSIGVERIFY,
     OP_RETURN_204 as OP_CHECKSIGFROMSTACK,
     OP_NOP4 as OP_CHECKTEMPLATEVERIFY,
     OP_DROP,
-    OP_ELSE,
-    OP_ENDIF,
-    OP_EQUALVERIFY,
     OP_NOP,
-    OP_IF,
-    OP_GREATERTHAN,
-    OP_OVER,
     OP_RETURN_205 as OP_PAIRCOMMIT,
-    OP_RETURN,
-    OP_SHA256,
     OP_SWAP,
     OP_TUCK,
     OP_VERIFY,
@@ -51,13 +33,12 @@ use bitcoin::opcodes::all::{
 
 use bitcoin::secp256k1::{
     Secp256k1,
-    Signing,
     Verification,
 };
 
 use rayon::{
+    iter::IntoParallelRefIterator,
     iter::ParallelIterator,
-    iter::IntoParallelIterator,
 };
 
 use std::{
@@ -81,9 +62,24 @@ use crate::{
     taptree_commit,
 };
 
+struct Transition {
+    next_state_index: usize,
+    // FIXME: do we care? we already know next state id
+    updating_party: PartyId,
+}
+
+struct TransactionParameters {
+    can_update: PartySet,
+    transitions: Vec<Transition>,
+}
+
+struct GenerationInfo {
+    transactions: Vec<TransactionParameters>,
+    depth: u32,
+}
+
 pub struct UpdateTransactionSetBuilder {
-    generations: Vec<BTreeMap<PartySet, usize>>,
-    depths: Vec<u32>,
+    generations: Vec<GenerationInfo>,
     keys: Vec<XOnlyPublicKey>,
     total_amount: Amount,
     settlement_relative_timelock: RelativeLockTime,
@@ -91,29 +87,75 @@ pub struct UpdateTransactionSetBuilder {
 
 impl UpdateTransactionSetBuilder {
     pub fn from_parties(keys: Vec<XOnlyPublicKey>, total_amount: Amount, settlement_relative_timelock: RelativeLockTime) -> Self {
-        let mut generations = Vec::new();
-        let mut depths = Vec::new();
+        let mut state_generations = Vec::new();
 
         let parties = PartySet::first_n(keys.len());
 
         for i in 0..parties.len() {
-            let mut generation = BTreeMap::new();
+            let mut state_generation = Vec::new();
+            let mut state_generation_index_map = BTreeMap::new();
 
             for (i, subset) in choose_k(&parties, parties.len() - i).into_iter().enumerate() {
-                generation.insert(subset, i);
+                state_generation_index_map.insert(subset.clone(), i);
+                state_generation.push(subset);
             }
 
-            let depth = Self::depth_for_generation_len(generation.len());
-
-            depths.push(depth);
-            generations.push(generation);
+            state_generations.push((state_generation, state_generation_index_map));
         }
+
+        let generations = state_generations.iter().enumerate()
+            .map(|(generation_index, (state_generation, index_map))| {
+                let next_generation_index = generation_index + 1;
+
+                let mut transactions = Vec::new();
+
+                for can_update_parties in state_generation.iter() {
+                    let mut transitions = Vec::new();
+                    assert!(can_update_parties.len() > 0);
+
+                    if let Some((_, ref next_generation)) = state_generations.get(next_generation_index) {
+                        for party in can_update_parties.iter() {
+                            let new_can_update_parties = {
+                                let mut parties = can_update_parties.clone();
+                                parties.remove(*party);
+
+                                parties
+                            };
+
+                            let index = next_generation[&new_can_update_parties];
+
+                            transitions.push(Transition {
+                                next_state_index: index,
+                                updating_party: party.clone(),
+                            });
+                        }
+
+                        transactions.push(TransactionParameters {
+                            can_update: can_update_parties.clone(),
+                            transitions,
+                        });
+                    } else {
+                        // The last generation only needs to be able to add the settlement tx
+                        // FIXME: inline settlement into this tx
+                        transactions.push(TransactionParameters {
+                            can_update: can_update_parties.clone(),
+                            transitions: Vec::new(),
+                        });
+                        assert_eq!(can_update_parties.len(), 1);
+                    }
+                }
+
+                GenerationInfo {
+                    transactions,
+                    depth: ilog2_ceil(state_generation.len()),
+                }
+            })
+            .collect();
 
         Self {
             generations,
             keys,
             total_amount,
-            depths,
             settlement_relative_timelock,
         }
     }
@@ -154,30 +196,25 @@ impl UpdateTransactionSetBuilder {
         };
 
         // Generation 0 is in the commitment transaction
-        for generation in 1..self.keys.len() {
-            let depth = self.depths[generation];
+        for (generation_index, generation) in self.generations.iter().enumerate().skip(1) {
+            let can_update_parties_count = self.keys.len() - generation_index;
+            let new_script_builder = UpdateScriptBuilder::new(can_update_parties_count, generation_index, generation.depth);
 
-            let new_script_builder = UpdateScriptBuilder::new(self.keys.len() - generation, generation, depth);
-
-            let tx_templates = (&self.generations[generation]).into_par_iter()
-                .map_with(new_script_builder, |script_builder, (parties, _index)| {
+            let tx_templates = generation.transactions.par_iter()
+                .map_with(new_script_builder, |script_builder, transaction_params| {
                     let internal_key = XOnlyPublicKey::from_slice(Self::NUMS_POINT.as_ref())
                             .unwrap();
 
-                    let mut tap_nodes: Vec<TapNodeHash> = Vec::with_capacity(parties.len());
+                    let mut tap_nodes: Vec<TapNodeHash> = Vec::with_capacity(transaction_params.transitions.len() + 1);
 
                     // FIXME: put this on key path instead? means more musig though
                     tap_nodes.push(settlement_tx_tapleaf_hash);
 
-                    if generation + 1 < party_count {
+                    if generation_index + 1 < party_count {
                         tap_nodes.extend(
-                            parties.iter()
-                                .map(|party_id| {
-                                    let next_parties = PartySet(parties.iter().filter(|party| **party != *party_id).cloned().collect());
-
-                                    let next_state_index = self.generations[generation + 1][&next_parties];
-
-                                    script_builder.build_script(self, update, *party_id, next_state_index);
+                            transaction_params.transitions.iter()
+                                .map(|transition| {
+                                    script_builder.build_script(self, update, transition.updating_party, transition.next_state_index);
 
                                     script_builder.as_tap_node()
                                 })
@@ -206,7 +243,7 @@ impl UpdateTransactionSetBuilder {
 
             let commitment = paircommit_merkle_commit(
                 tx_templates.into_iter(),
-                depth as usize,
+                generation.depth as usize,
             );
 
             commitments.push(commitment);
@@ -219,10 +256,6 @@ impl UpdateTransactionSetBuilder {
         }
 
         rhs
-    }
-
-    fn key_index_to_party_id(i: usize) -> PartyId {
-        (i + 1) as PartyId
     }
 
     fn build_settlement_tx<C: Verification>(&self, secp: &Secp256k1<C>, parties: &PartySet, update: &StateUpdate) -> Transaction {
@@ -275,6 +308,7 @@ impl UpdateScriptBuilder {
             + (party_count - 1) * (32 + 1) // pubkey bytes plus push opcode
             + (party_count - 1) * 3 // TUCK CSFS VERIFY
             - 1 // Last CSFS doesn't need a VERIFY
+            + 64 // FIXME: just to see if it affects performance/saves an allocation
             + 0; //
 
         Self {
@@ -292,8 +326,8 @@ impl UpdateScriptBuilder {
         // We could also just build the script once and replace things in it here. Would be
         // *slightly* faster, probably not enough to be worth it.
         // We actually have a large(?) opportunity to avoid copies by swapping the auth sig
-        // and the csfs sig in place instead of writing all of the keys 
-        // Need to keep track of the last auth key used to know how to build the next script 
+        // and the csfs sig in place instead of writing all of the keys
+        // Need to keep track of the last auth key used to know how to build the next script
         let party_count = update_builder.keys.len();
         let mut buffer = std::mem::replace(&mut self.buffer, Vec::new());
         buffer.truncate(0);
@@ -305,6 +339,7 @@ impl UpdateScriptBuilder {
             .push_opcode(OP_CHECKSIGVERIFY)
             .push_opcode(OP_CHECKTEMPLATEVERIFY);
 
+        println!("depth = {depth}", depth = self.depth);
         for _ in 0..self.depth {
             if (next_state_index & 1) == 1 {
                 builder = builder
@@ -320,14 +355,17 @@ impl UpdateScriptBuilder {
         }
 
         for _ in 1..self.generation {
+            println!("PC");
             builder = builder
                 .push_opcode(OP_PAIRCOMMIT);
         }
 
         if self.generation == party_count {
+            println!("last generation");
             builder = builder
                 .push_opcode(OP_PAIRCOMMIT);
         } else {
+            println!("other than last generation");
             builder = builder
                 .push_opcode(OP_SWAP)
                 .push_opcode(OP_PAIRCOMMIT);
@@ -359,15 +397,7 @@ impl UpdateScriptBuilder {
     }
 
     pub fn as_tap_node(&self) -> TapNodeHash {
-        TapNodeHash::from_script(Script::from_bytes(&self.buffer), LeafVersion::TapScript)
-    }
-}
-
-impl std::ops::Deref for UpdateTransactionSetBuilder {
-    type Target = Vec<BTreeMap<PartySet, usize>>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.generations
+        TapNodeHash::from_script(self.as_script(), LeafVersion::TapScript)
     }
 }
 
@@ -383,6 +413,10 @@ mod test {
     use bitcoin::bip32::{
         ChildNumber,
         Xpriv,
+    };
+
+    use bitcoin::secp256k1::{
+        Signing,
     };
 
     use std::str::FromStr;
@@ -431,23 +465,15 @@ mod test {
         let secp = Secp256k1::new();
         let set = UpdateTransactionSetBuilder::from_parties(test_keys(&secp, 4), Amount::from_sat(100000000), SETTLEMENT_TIMELOCK);
 
-        let depth = UpdateTransactionSetBuilder::depth_for_generation_len(set.generations[1].len());
-
-        let mut builder = UpdateScriptBuilder::new(3, 1, depth);
-        let update = StateUpdate { state: 1, split: even_split(&set) };
-
-        let parties = PartySet(
-            set.keys.iter().enumerate().map(|(index, _)| index as PartyId).collect()
+        let mut builder = UpdateScriptBuilder::new(
+            3, 1,
+            set.generations[1].depth,
         );
 
+        let update = StateUpdate { state: 1, split: even_split(&set) };
+
         let updater: PartyId = 0;
-
-        let mut next_parties = parties.clone();
-        next_parties.remove(updater);
-
-        let next_state_index = set.generations[1][&next_parties];
-
-        assert_eq!(next_state_index, 3);
+        let next_state_index = 3;
 
         builder.build_script(&set, &update, updater, next_state_index);
 
@@ -516,10 +542,10 @@ mod test {
 
         println!("duration = {}s", duration.as_secs_f64());
 
-        assert_eq!(set[0].len(), 1);
-        assert_eq!(set[1].len(), 5);
-        assert_eq!(set[2].len(), 10);
-        assert_eq!(set[3].len(), 10);
-        assert_eq!(set[4].len(), 5);
+        assert_eq!(set.generations[0].transactions.len(), 1);
+        assert_eq!(set.generations[1].transactions.len(), 5);
+        assert_eq!(set.generations[2].transactions.len(), 10);
+        assert_eq!(set.generations[3].transactions.len(), 10);
+        assert_eq!(set.generations[4].transactions.len(), 5);
     }
 }
