@@ -117,9 +117,10 @@ fn get_default_template(transaction: &Transaction, input_index: u32) -> Sha256 {
     Sha256::from_engine(sha256)
 }
 
+const PAY_TO_ANCHOR_SCRIPT_BYTES: &[u8] = &[0x51, 0x02, 0x4e, 0x73];
+
 fn ephemeral_anchor() -> TxOut {
-    let mut script_pubkey = ScriptBuf::new();
-    script_pubkey.push_opcode(OP_TRUE);
+    let script_pubkey = ScriptBuf::from_bytes(PAY_TO_ANCHOR_SCRIPT_BYTES.to_vec());
 
     TxOut {
         value: Amount::from_sat(0),
