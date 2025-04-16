@@ -12,6 +12,7 @@ On top of this, network latency, and storage latency will also affect performanc
 
 The code is also downright embarassing in places.
 There are places where I wrote something that I know I didn't think through all the way, it's likely buggy, but for the purposes of estimating performance it's close enough to correct to be ok.
+As of 2025-04-16 there should be less of these, but not zero.
 If there's any interest I intend to expand this into a working proof of concept complete with P2P.
 
 # Penalty Problems
@@ -25,8 +26,7 @@ In the penalty scheme, the other parties cannot publish the second-to-latest sta
 ### Brute Force
 
 By adding more states to every update, we can enable honest parties to safely publish state S even when S+1 has been fully signed (but the malicious party has witheld signatures).
-I'm not positive yet how much extra complexity that adds, but I expect it to be significant.
-
+This is, as you'd imagine, very slow to precompute.
 Every update we partition the set of all parties into two subsets: `can_update` and `cant_update`.
 In the penalty version we partition `cant_update` into three subsets: `penalized`, `maybe_penalize`, `last_updater`.
 `maybe_penalize` and `last_updater` are both sizes 0 or 1.
@@ -37,3 +37,8 @@ If the update only advances the state by one, and does have a revocation signatu
 If the update advances the state by more than one then the `maybe_penalize` and `last_updater` move into the `penalized` set.
 
 This should add `P choose 2 + P choose 1 + 1` states for P in `[0, max_generation]`
+
+# Future Work
+
+- The symmetry version can actually be made O(n) instead of O(2^n) which would be a massive improvement.
+- Watchtower support can be added to penalty without much risk, by giving watchtowers their own states in the state machine, which are not penalized the same way.
